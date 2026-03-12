@@ -10,34 +10,61 @@
 
 <!-- ══ SUPABASE CONFIG ══ -->
 <script>
-const SUPA_URL = 'https://otowmqoahuarrhwqduzg.supabase.co';
-const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im90b3dtcW9haHVhcnJod3FkdXpnIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzMyODYwNTEsImV4cCI6MjA4ODg2MjA1MX0.xmrCf8rRc7RlOGCG8YYjNJMaRVhxkKI9Qfm0_UV8AN8';
+const SUPA_URL   = 'https://otowmqoahuarrhwqduzg.supabase.co';
+const SUPA_KEY   = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im90b3dtcW9haHVhcnJod3FkdXpnIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzMyODYwNTEsImV4cCI6MjA4ODg2MjA1MX0.xmrCf8rRc7RlOGCG8YYjNJMaRVhxkKI9Qfm0_UV8AN8';
 const SUPA_TABLE = 'inventory_state';
-
 const _sh = { 'Content-Type': 'application/json', 'apikey': SUPA_KEY, 'Authorization': 'Bearer ' + SUPA_KEY };
 
-// ── Read one key from Supabase ──
+// ══════════════════════════════════════════════════════
+//  STORAGE STRATEGY: Per-row — mỗi mã hàng = 1 row
+//  Key scheme:
+//    "meta"           → products list + config + seasonal
+//    "p:{code}"       → {ton_dau, nhap, xuat, ton_cuoi}[] cho 1 mã
+//    "weeks"          → weekHistory array
+//    "returns"        → returnHistory array
+//    "shortages"      → shortageHistory array
+//  → Save 1 mã = ~1KB upload, không save lại 4000 mã khác
+// ══════════════════════════════════════════════════════
+
+// ── Low-level: get/set one row ──
 async function supaGet(key) {
   try {
-    const r = await fetch(`${SUPA_URL}/rest/v1/${SUPA_TABLE}?key=eq.${key}&select=value`, { headers: _sh });
+    const r = await fetch(
+      `${SUPA_URL}/rest/v1/${SUPA_TABLE}?key=eq.${encodeURIComponent(key)}&select=value`,
+      { headers: _sh }
+    );
     const d = await r.json();
-    return d && d[0] ? d[0].value : null;
+    return (d && d[0]) ? d[0].value : null;
   } catch(e) { return null; }
 }
 
-// ── Upsert one key to Supabase ──
 async function supaSet(key, value) {
   try {
-    await fetch(`${SUPA_URL}/rest/v1/${SUPA_TABLE}`, {
-      method: 'POST',
+    const r = await fetch(`${SUPA_URL}/rest/v1/${SUPA_TABLE}`, {
+      method:  'POST',
       headers: { ..._sh, 'Prefer': 'resolution=merge-duplicates' },
-      body: JSON.stringify({ key, value, updated_at: new Date().toISOString() })
+      body:    JSON.stringify({ key, value, updated_at: new Date().toISOString() })
     });
-    return true;
+    return r.ok;
   } catch(e) { return false; }
 }
 
-// ── Sync indicator in nav ──
+// Bulk fetch nhiều rows một lúc (dùng IN filter)
+async function supaGetMany(keys) {
+  try {
+    const keysParam = '(' + keys.map(k => `"${k}"`).join(',') + ')';
+    const r = await fetch(
+      `${SUPA_URL}/rest/v1/${SUPA_TABLE}?key=in.${keysParam}&select=key,value`,
+      { headers: _sh }
+    );
+    const d = await r.json();
+    const map = {};
+    if (Array.isArray(d)) d.forEach(row => { map[row.key] = row.value; });
+    return map;
+  } catch(e) { return {}; }
+}
+
+// ── Sync indicator ──
 function setSyncStatus(status) {
   const el = document.getElementById('sync-status');
   if (!el) return;
@@ -52,89 +79,193 @@ function setSyncStatus(status) {
   el.style.color = s.color;
 }
 
-// ── Debounced cloud save (batch writes, don't spam API) ──
-let _saveTimer = null;
-async function saveStateCloud() {
-  setSyncStatus('saving');
-  const mainData = {
-    products: state.products,
-    ton_dau_by_month:  state.ton_dau_by_month,
-    nhap_by_month:     state.nhap_by_month,
-    xuat_by_month:     state.xuat_by_month,
-    ton_cuoi_by_month: state.ton_cuoi_by_month,
-    seasonalOverride:  state.seasonalOverride,
-    tbManual:          state.tbManual,
-    abcdConfig:        state.abcdConfig,
-    seasonalFactors:   state.seasonalFactors,
-  };
-  const results = await Promise.all([
-    supaSet('xnt_state',     mainData),
-    supaSet('xnt_weeks',     state.weekHistory),
-    supaSet('xnt_returns',   state.returnHistory),
-    supaSet('xnt_shortages', state.shortageHistory),
-  ]);
-  setSyncStatus(results.every(Boolean) ? 'saved' : 'offline');
+// ══════════════════════════════════════════════════════
+//  DIRTY TRACKING — chỉ upload rows đã thay đổi
+// ══════════════════════════════════════════════════════
+const _dirty = new Set(); // set of keys cần upload
+
+function markDirty(key) { _dirty.add(key); }
+
+// Gọi khi 1 mã hàng thay đổi số liệu
+function markProductDirty(code) {
+  markDirty('p:' + code);
+  markDirty('meta'); // products list có thể thay đổi
 }
 
+// ── Debounced cloud save — chỉ gửi các rows dirty ──
+let _saveTimer = null;
+async function saveStateCloud() {
+  if (_dirty.size === 0) { setSyncStatus('saved'); return; }
+  setSyncStatus('saving');
+
+  const tasks = [];
+
+  // meta: products list + config
+  if (_dirty.has('meta')) {
+    tasks.push(supaSet('meta', {
+      products:       state.products,
+      seasonalOverride: state.seasonalOverride,
+      tbManual:       state.tbManual,
+      abcdConfig:     state.abcdConfig,
+      seasonalFactors: state.seasonalFactors,
+    }));
+  }
+
+  // Per-product rows
+  for (const key of _dirty) {
+    if (!key.startsWith('p:')) continue;
+    const code = key.slice(2);
+    tasks.push(supaSet(key, {
+      ton_dau:  state.ton_dau_by_month[code]  || [],
+      nhap:     state.nhap_by_month[code]     || [],
+      xuat:     state.xuat_by_month[code]     || [],
+      ton_cuoi: state.ton_cuoi_by_month[code] || [],
+    }));
+  }
+
+  // History tables (always small, save as-is)
+  if (_dirty.has('weeks'))     tasks.push(supaSet('weeks',     state.weekHistory));
+  if (_dirty.has('returns'))   tasks.push(supaSet('returns',   state.returnHistory));
+  if (_dirty.has('shortages')) tasks.push(supaSet('shortages', state.shortageHistory));
+
+  const results = await Promise.all(tasks);
+  if (results.every(Boolean)) {
+    _dirty.clear();
+    setSyncStatus('saved');
+  } else {
+    setSyncStatus('offline');
+    // Keep dirty so next save retries
+  }
+}
+
+// ── Main saveState — localStorage instant + debounced cloud ──
 function saveState() {
-  // 1. Always write to localStorage instantly (offline cache)
+  // 1. localStorage (instant, offline cache)
   localStorage.setItem('xnt_state', JSON.stringify({
-    products: state.products,
-    ton_dau_by_month:  state.ton_dau_by_month,
-    nhap_by_month:     state.nhap_by_month,
-    xuat_by_month:     state.xuat_by_month,
-    ton_cuoi_by_month: state.ton_cuoi_by_month,
-    seasonalOverride:  state.seasonalOverride,
-    tbManual:          state.tbManual,
-    abcdConfig:        state.abcdConfig,
-    seasonalFactors:   state.seasonalFactors,
+    products:         state.products,
+    ton_dau_by_month: state.ton_dau_by_month,
+    nhap_by_month:    state.nhap_by_month,
+    xuat_by_month:    state.xuat_by_month,
+    ton_cuoi_by_month:state.ton_cuoi_by_month,
+    seasonalOverride: state.seasonalOverride,
+    tbManual:         state.tbManual,
+    abcdConfig:       state.abcdConfig,
+    seasonalFactors:  state.seasonalFactors,
   }));
   localStorage.setItem('xnt_weeks',     JSON.stringify(state.weekHistory));
   localStorage.setItem('xnt_returns',   JSON.stringify(state.returnHistory));
   localStorage.setItem('xnt_shortages', JSON.stringify(state.shortageHistory));
-  // 2. Debounce cloud save: wait 1.2s after last change before writing to Supabase
+
+  // 2. Mark all products dirty (full save — dùng khi không biết mã nào thay đổi)
+  markDirty('meta');
+  state.products.forEach(p => markDirty('p:' + p.code));
+  markDirty('weeks'); markDirty('returns'); markDirty('shortages');
+
+  // 3. Debounce 1.5s
   clearTimeout(_saveTimer);
-  _saveTimer = setTimeout(saveStateCloud, 1200);
+  _saveTimer = setTimeout(saveStateCloud, 1500);
 }
 
-// ── Load from Supabase on startup ──
-// Returns true if cloud data was loaded, false = use localStorage/preloaded
+// Bản saveState tối ưu: chỉ dirty mã cụ thể (dùng trong onDeChange, saveWeekData, etc.)
+function saveStatePartial(changedCodes = [], historyKeys = []) {
+  localStorage.setItem('xnt_state', JSON.stringify({
+    products:         state.products,
+    ton_dau_by_month: state.ton_dau_by_month,
+    nhap_by_month:    state.nhap_by_month,
+    xuat_by_month:    state.xuat_by_month,
+    ton_cuoi_by_month:state.ton_cuoi_by_month,
+    seasonalOverride: state.seasonalOverride,
+    tbManual:         state.tbManual,
+    abcdConfig:       state.abcdConfig,
+    seasonalFactors:  state.seasonalFactors,
+  }));
+  if (changedCodes.length) {
+    markDirty('meta');
+    changedCodes.forEach(c => markDirty('p:' + c));
+  }
+  historyKeys.forEach(k => {
+    if (k === 'weeks')     { localStorage.setItem('xnt_weeks',     JSON.stringify(state.weekHistory)); markDirty('weeks'); }
+    if (k === 'returns')   { localStorage.setItem('xnt_returns',   JSON.stringify(state.returnHistory)); markDirty('returns'); }
+    if (k === 'shortages') { localStorage.setItem('xnt_shortages', JSON.stringify(state.shortageHistory)); markDirty('shortages'); }
+  });
+  clearTimeout(_saveTimer);
+  _saveTimer = setTimeout(saveStateCloud, 1500);
+}
+
+// ══════════════════════════════════════════════════════
+//  LOAD FROM CLOUD — khi mở app
+// ══════════════════════════════════════════════════════
 async function loadFromCloud() {
   setSyncStatus('loading');
   try {
-    const [main, weeks, returns, shortages] = await Promise.all([
-      supaGet('xnt_state'),
-      supaGet('xnt_weeks'),
-      supaGet('xnt_returns'),
-      supaGet('xnt_shortages'),
-    ]);
-    if (!main || !main.products || main.products.length === 0) {
-      setSyncStatus('saved'); return false; // No cloud data yet
+    // Step 1: load meta + history (4 rows)
+    const metaMap = await supaGetMany(['meta', 'weeks', 'returns', 'shortages']);
+    const meta = metaMap['meta'];
+    if (!meta || !meta.products || meta.products.length === 0) {
+      setSyncStatus('saved'); return false;
     }
-    // Apply cloud data to state
-    state.products          = main.products          || [];
-    state.ton_dau_by_month  = main.ton_dau_by_month  || {};
-    state.nhap_by_month     = main.nhap_by_month      || {};
-    state.xuat_by_month     = main.xuat_by_month      || {};
-    state.ton_cuoi_by_month = main.ton_cuoi_by_month  || {};
-    state.seasonalOverride  = main.seasonalOverride   || {};
-    state.tbManual          = main.tbManual            || {};
-    if (main.abcdConfig) Object.keys(main.abcdConfig).forEach(k => {
-      state.abcdConfig[k] = { hs: main.abcdConfig[k].hs ?? 1.3 };
+
+    // Step 2: load per-product rows in batches of 50
+    const codes = meta.products.map(p => p.code);
+    const productKeys = codes.map(c => 'p:' + c);
+    const productData = {};
+
+    const BATCH = 50;
+    for (let i = 0; i < productKeys.length; i += BATCH) {
+      const batch = productKeys.slice(i, i + BATCH);
+      const batchMap = await supaGetMany(batch);
+      Object.assign(productData, batchMap);
+      // Update progress
+      setSyncStatus('loading');
+      const pct = Math.round(Math.min(100, ((i + BATCH) / productKeys.length) * 100));
+      const el = document.getElementById('sync-status');
+      if (el) el.textContent = `⏳ Đang tải... ${pct}%`;
+    }
+
+    // Step 3: assemble state
+    state.products         = meta.products         || [];
+    state.seasonalOverride = meta.seasonalOverride  || {};
+    state.tbManual         = meta.tbManual          || {};
+    if (meta.abcdConfig) Object.keys(meta.abcdConfig).forEach(k => {
+      state.abcdConfig[k] = { hs: meta.abcdConfig[k].hs ?? 1.3 };
     });
-    if (main.seasonalFactors?.length === 12) state.seasonalFactors = main.seasonalFactors;
-    state.weekHistory    = Array.isArray(weeks)    ? weeks    : [];
-    state.returnHistory  = Array.isArray(returns)  ? returns  : [];
-    state.shortageHistory= Array.isArray(shortages)? shortages: [];
+    if (meta.seasonalFactors?.length === 12) state.seasonalFactors = meta.seasonalFactors;
+
+    state.ton_dau_by_month  = {};
+    state.nhap_by_month     = {};
+    state.xuat_by_month     = {};
+    state.ton_cuoi_by_month = {};
+    state.products.forEach(p => {
+      const row = productData['p:' + p.code] || {};
+      const N   = ALL_MONTHS.length;
+      const pad = (arr) => { const a = arr ? [...arr] : []; while(a.length < N) a.push(0); return a; };
+      state.ton_dau_by_month[p.code]  = pad(row.ton_dau);
+      state.nhap_by_month[p.code]     = pad(row.nhap);
+      state.xuat_by_month[p.code]     = pad(row.xuat);
+      state.ton_cuoi_by_month[p.code] = pad(row.ton_cuoi);
+    });
+
+    state.weekHistory    = Array.isArray(metaMap['weeks'])     ? metaMap['weeks']     : [];
+    state.returnHistory  = Array.isArray(metaMap['returns'])   ? metaMap['returns']   : [];
+    state.shortageHistory= Array.isArray(metaMap['shortages']) ? metaMap['shortages'] : [];
+
     ensureArrayLengths();
-    // Mirror to localStorage as offline cache
-    localStorage.setItem('xnt_state',     JSON.stringify(main));
+
+    // Mirror to localStorage
+    localStorage.setItem('xnt_state', JSON.stringify({
+      products: state.products, ton_dau_by_month: state.ton_dau_by_month,
+      nhap_by_month: state.nhap_by_month, xuat_by_month: state.xuat_by_month,
+      ton_cuoi_by_month: state.ton_cuoi_by_month, seasonalOverride: state.seasonalOverride,
+      tbManual: state.tbManual, abcdConfig: state.abcdConfig, seasonalFactors: state.seasonalFactors,
+    }));
     localStorage.setItem('xnt_weeks',     JSON.stringify(state.weekHistory));
     localStorage.setItem('xnt_returns',   JSON.stringify(state.returnHistory));
     localStorage.setItem('xnt_shortages', JSON.stringify(state.shortageHistory));
+
     setSyncStatus('saved');
     return true;
   } catch(e) {
+    console.error('loadFromCloud error:', e);
     setSyncStatus('offline');
     return false;
   }
